@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+# docker-sops: per-stack sparse worktrees + SOPS + docker compose
+# - Bare repos:      /mnt/user/Docker/.repos/{docker-compose.git,docker-compose-env.git}
+# - Per-stack trees: /mnt/user/Docker/.worktrees/{compose-<stack>,env-<stack>}
+# - Flat stack dir:  /mnt/user/Docker/<stack>/  (symlinks to compose worktree)
+# - Top-level secret: /mnt/user/Docker/<stack>.env.sops  (symlink to env worktree)
+# - Global config:   /mnt/user/Docker/.docker-sops.conf
+# - Hardened: set -Eeuo pipefail, noglob, stack-name validation
+# - NEW: If <stack> is omitted, infer it from CWD when inside /mnt/user/Docker/<stack>
+
+set -Eeuo pipefail
+set -o noglob
+
+# -------- constants / layout --------
+BASE_DIR="/mnt/user/Docker"
+CONF_FILE="${BASE_DIR}/.docker-sops.conf"
+
+REPOS_DIR="${BASE_DIR}/.repos"
+WORKTREES_DIR="${BASE_DIR}/.worktrees"
+
+COMPOSE_BARE="${REPOS_DIR}/docker-compose.git"
+ENV_BARE="${REPOS_DIR}/docker-compose-env.git"
+
+SOPS_BIN="${SOPS_BIN:-sops}"
+DOCKER_BIN="${DOCKER_BIN:-docker}"
+
+# -------- helpers --------
+die(){ echo "ERROR: $*" >&2; exit 1; }
+note(){ echo "[docker-sops] $*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Required binary not found: $1"; }
+
+read_conf(){ [[ -f "$CONF_FILE" ]] && source "$CONF_FILE" || true; }  # shellcheck disable=SC1090
+save_conf(){
+  umask 077
+  cat >"$CONF_FILE" <<EOF
+COMPOSE_REPO_URL=${COMPOSE_REPO_URL:-}
+COMPOSE_BRANCH=${COMPOSE_BRANCH:-main}
+ENV_REPO_URL=${ENV_REPO_URL:-}
+ENV_BRANCH=${ENV_BRANCH:-main}
+EOF
+  note "Saved config at $CONF_FILE"
+}
+
+cleanup(){
+  [[ -n "${TEMP_ENV:-}" && -f "$TEMP_ENV" ]] || return 0
+  if command -v shred >/dev/null 2>&1; then shred -u "$TEMP_ENV"; else rm -f "$TEMP_ENV"; fi
+}
+trap cleanup EXIT INT TERM
+
+usage(){
+cat <<'EOF'
+Usage:
+  # One-time per stack
+  docker-sops init <stack> --compose-url URL --env-url URL [--compose-branch BR] [--env-branch BR]
+
+  # Daily (stack inferred if you run inside /mnt/user/Docker/<stack>)
+  docker-sops [<stack>] up|down|pull|ps|logs|config|restart [-- extra docker compose args]
+  docker-sops [<stack>] git [git-args…]       # run git in compose worktree
+  docker-sops [<stack>] git-env [git-args…]   # run git in env worktree
+  docker-sops [<stack>] edit-env              # open SOPS editor for <stack>.env.sops
+
+  # Global
+  docker-sops full-pull                       # update all worktrees (compose + env)
+  docker-sops full-push                       # push all worktrees (compose + env)
+  docker-sops config [--show]
+  docker-sops help
+
+Notes:
+- When run from /mnt/user/Docker/<stack>, you can omit <stack> entirely (e.g., 'docker-sops up').
+- Files you edit in /mnt/user/Docker/<stack> are symlinks into the compose worktree.
+- Use 'git'/'git-env' subcommands to commit/push without leaving the flat folder.
+
+Env overrides:
+  SOPS_FILE=/abs/path/to/<stack>.env.sops   (override secrets path)
+  SOPS_BIN, DOCKER_BIN                      (paths to sops/docker)
+EOF
+}
+
+# -------- paths for a stack --------
+compose_worktree_dir(){ echo "${WORKTREES_DIR}/compose-$1"; }
+env_worktree_dir(){     echo "${WORKTREES_DIR}/env-$1"; }
+compose_repo_subdir(){  echo "docker-compose/$1"; }
+env_repo_subdir(){      echo "docker-compose-env/$1"; }
+
+compose_src_dir(){ echo "$(compose_worktree_dir "$1")/$(compose_repo_subdir "$1")"; }
+env_secret_src(){  echo "$(env_worktree_dir "$1")/$(env_repo_subdir "$1")/$1.env.sops"; }
+
+stack_flat_dir(){  echo "${BASE_DIR}/$1"; }
+top_secret_link(){ echo "${BASE_DIR}/$1.env.sops"; }
+
+# Infer stack from CWD if inside /mnt/user/Docker/<stack>[/...]
+infer_stack_from_cwd(){
+  local wd="$PWD"
+  case "$wd" in
+    "$BASE_DIR") return 1 ;;
+    "$BASE_DIR"/*)
+      # first path segment after BASE_DIR
+      local rest="${wd#$BASE_DIR/}"
+      local seg="${rest%%/*}"
+      [[ "$seg" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+      echo "$seg"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# -------- git plumbing --------
+ensure_bare_repo(){
+  local bare="$1" url="$2" branch="$3"
+  if [[ ! -d "$bare" ]]; then
+    mkdir -p "$(dirname "$bare")"
+    note "Cloning bare repo -> $bare"
+    git clone --bare --branch "$branch" "$url" "$bare" >/dev/null
+  else
+    git --git-dir="$bare" remote set-url origin "$url" || true
+    git --git-dir="$bare" fetch origin >/dev/null
+  fi
+}
+
+ensure_sparse_worktree(){
+  local bare="$1" wdir="$2" branch="$3" pathspec="$4"
+  if [[ ! -d "$wdir/.git" ]]; then
+    mkdir -p "$wdir"
+    git --git-dir="$bare" worktree add --detach "$wdir" "origin/$branch" >/dev/null
+    (
+      cd "$wdir"
+      git sparse-checkout init --cone
+      git sparse-checkout set "$pathspec"
+      git checkout -q "origin/$branch"
+    )
+  else
+    (
+      cd "$wdir"
+      git fetch -q origin
+      git checkout -q "origin/$branch"
+      git pull -q --ff-only || true
+      git sparse-checkout set "$pathspec"
+    )
+  fi
+}
+
+# -------- symlink flattening --------
+refresh_flat_links(){
+  # Mirror files from compose_src_dir into stack_flat_dir via symlinks
+  local stack="$1"
+  local src dst marker name
+  src="$(compose_src_dir "$stack")"
+  dst="$(stack_flat_dir "$stack")"
+  marker="${dst}/.docker-sops-links"
+
+  mkdir -p "$dst"
+  [[ -d "$src" ]] || die "Compose folder not found in worktree: $src"
+
+  # remove previously-created links
+  if [[ -f "$marker" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      [[ -L "${dst}/${name}" ]] && rm -f "${dst}/${name}" || true
+    done < "$marker"
+    : > "$marker"
+  else
+    : > "$marker"
+  fi
+
+  # re-create links for everything in src (files and subdirs)
+  local f
+  # shellcheck disable=SC2045
+  for f in $(ls -A "$src"); do
+    name="$(basename "$f")"
+    [[ "$name" == ".git" ]] && continue
+    [[ -e "${dst}/${name}" && ! -L "${dst}/${name}" ]] && continue
+    ln -s "$(realpath --relative-to="$dst" "$src")/${name}" "${dst}/${name}" 2>/dev/null && echo "$name" >> "$marker" || true
+  done
+}
+
+# -------- secrets link --------
+ensure_secret_link(){
+  local stack="$1"
+  local src dest
+  src="$(env_secret_src "$stack")"
+  dest="$(top_secret_link "$stack")"
+  [[ -f "$src" ]] || die "Encrypted env not found in env worktree: $src"
+  [[ -e "$dest" ]] || { ln -s "$src" "$dest" && note "Linked ${dest} -> ${src}"; }
+}
+
+determine_secrets_file(){
+  local stack="$1"
+  if [[ -n "${SOPS_FILE:-}" ]]; then
+    [[ -f "$SOPS_FILE" ]] || die "SOPS_FILE not found: $SOPS_FILE"
+    echo "$SOPS_FILE"; return
+  fi
+  local f; f="$(top_secret_link "$stack")"
+  [[ -f "$f" ]] || die "Secrets file not found: $f (set SOPS_FILE to override)"
+  echo "$f"
+}
+
+decrypt_env(){
+  local sops_file="$1"
+  local data
+  data="$($SOPS_BIN -d "$sops_file")" || die "Failed to decrypt: $sops_file"
+  TEMP_ENV="$(mktemp -t "${STACK}.env.XXXXXXXX")"
+  chmod 600 "$TEMP_ENV"
+  printf '%s' "$data" > "$TEMP_ENV"
+}
+
+compose_yml_path(){ echo "$(compose_src_dir "$1")/docker-compose.yml"; }
+
+run_compose(){
+  local stack="$1"; shift
+  local yml
+  yml="$(compose_yml_path "$stack")"
+  [[ -f "$yml" ]] || die "Compose file not found: $yml"
+  ( cd "$(stack_flat_dir "$stack")" && $DOCKER_BIN compose --env-file "$TEMP_ENV" -f "$yml" "$@" )
+}
+
+# -------- convenience git wrappers --------
+compose_git(){ local stack="$1"; shift; ( cd "$(compose_worktree_dir "$stack")" && git "$@" ); }
+env_git(){     local stack="$1"; shift; ( cd "$(env_worktree_dir "$stack")" && git "$@" ); }
+
+# -------- high-level ops --------
+init_stack(){
+  local stack="$1"
+  read_conf
+  [[ -n "${COMPOSE_REPO_URL:-}" && -n "${ENV_REPO_URL:-}" ]] || die "Missing repo URLs. Run init with --compose-url and --env-url."
+
+  mkdir -p "$BASE_DIR" "$REPOS_DIR" "$WORKTREES_DIR"
+
+  ensure_bare_repo "$COMPOSE_BARE" "${COMPOSE_REPO_URL}" "${COMPOSE_BRANCH:-main}"
+  ensure_bare_repo "$ENV_BARE"     "${ENV_REPO_URL}"     "${ENV_BRANCH:-main}"
+
+  ensure_sparse_worktree "$COMPOSE_BARE" "$(compose_worktree_dir "$stack")" "${COMPOSE_BRANCH:-main}" "docker-compose/${stack}"
+  ensure_sparse_worktree "$ENV_BARE"     "$(env_worktree_dir "$stack")"     "${ENV_BRANCH:-main}"     "docker-compose-env/${stack}"
+
+  refresh_flat_links "$stack"
+  ensure_secret_link "$stack"
+  note "Init complete for '${stack}'."
+}
+
+update_stack(){
+  local stack="$1"
+  read_conf
+  ensure_sparse_worktree "$COMPOSE_BARE" "$(compose_worktree_dir "$stack")" "${COMPOSE_BRANCH:-main}" "docker-compose/${stack}"
+  ensure_sparse_worktree "$ENV_BARE"     "$(env_worktree_dir "$stack")"     "${ENV_BRANCH:-main}"     "docker-compose-env/${stack}"
+  refresh_flat_links "$stack"
+  ensure_secret_link "$stack"
+}
+
+full_pull_all(){
+  read_conf
+  [[ -d "$COMPOSE_BARE" || -d "$ENV_BARE" ]] || die "No bare repos found. Run 'docker-sops init <stack> ...' first."
+  if [[ -d "$WORKTREES_DIR" ]]; then
+    for d in "$WORKTREES_DIR"/compose-* "$WORKTREES_DIR"/env-*; do
+      [[ -d "$d/.git" ]] || continue
+      ( cd "$d" && git fetch -q origin && git pull -q --ff-only || true )
+    done
+  fi
+  note "Full pull complete."
+}
+
+full_push_all(){
+  if [[ -d "$WORKTREES_DIR" ]]; then
+    for d in "$WORKTREES_DIR"/compose-* "$WORKTREES_DIR"/env-*; do
+      [[ -d "$d/.git" ]] || continue
+      ( cd "$d" && git push || true )
+    done
+  fi
+  note "Full push complete."
+}
+
+# -------- main --------
+need "$SOPS_BIN"; need "$DOCKER_BIN"; $DOCKER_BIN compose version >/devnull 2>&1 || die "Need Docker Compose plugin (docker compose)"
+
+sub="${1:-}"
+
+# Global commands that never infer stack
+if [[ -z "$sub" ]]; then usage; exit 1; fi
+case "$sub" in
+  help|--help|-h) usage; exit 0 ;;
+  config)
+    shift || true
+    if [[ "${1:-}" == "--show" ]]; then
+      [[ -f "$CONF_FILE" ]] && cat "$CONF_FILE" || { echo "No config yet at $CONF_FILE"; echo "Set via: docker-sops init <stack> --compose-url URL --env-url URL"; }
+      exit 0
+    fi
+    usage; exit 0
+    ;;
+  full-pull) full_pull_all; exit 0 ;;
+  full-push) full_push_all; exit 0 ;;
+  init)
+    shift || true
+    STACK="${1:-}"; [[ -n "$STACK" ]] || die "Usage: docker-sops init <stack> --compose-url URL --env-url URL"
+    [[ "$STACK" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Invalid stack name: '$STACK' (letters, digits, dot, underscore, dash)"
+    shift || true
+    COMPOSE_REPO_URL=""; ENV_REPO_URL=""; COMPOSE_BRANCH="main"; ENV_BRANCH="main"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --compose-url)    COMPOSE_REPO_URL="${2:-}"; shift 2;;
+        --env-url)        ENV_REPO_URL="${2:-}";     shift 2;;
+        --compose-branch) COMPOSE_BRANCH="${2:-main}"; shift 2;;
+        --env-branch)     ENV_BRANCH="${2:-main}";     shift 2;;
+        *) break;;
+      esac
+    done
+    [[ -n "$COMPOSE_REPO_URL" && -n "$ENV_REPO_URL" ]] || die "Both --compose-url and --env-url are required."
+    save_conf
+    init_stack "$STACK"
+    exit 0
+    ;;
+esac
+
+# If first token is a known command, infer stack from CWD
+KNOWN_CMDS="up down pull ps logs config restart git git-env edit-env"
+if [[ " $KNOWN_CMDS " == *" $sub "* ]]; then
+  STACK="$(infer_stack_from_cwd)" || die "Cannot infer stack from CWD; cd into /mnt/user/Docker/<stack> or specify <stack> explicitly."
+  cmd="$sub"
+  shift || true
+else
+  # First token is <stack>, second is command (or help)
+  STACK="$sub"
+  [[ "$STACK" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Invalid stack name: '$STACK' (letters, digits, dot, underscore, dash)"
+  cmd="${2:-help}"
+  shift || true; shift || true
+fi
+
+# special convenience (no repo update/decrypt needed)
+if [[ "$cmd" == "git" ]]; then
+  compose_git "$STACK" "$@"; exit $?
+elif [[ "$cmd" == "git-env" ]]; then
+  env_git "$STACK" "$@"; exit $?
+elif [[ "$cmd" == "edit-env" ]]; then
+  "$SOPS_BIN" "$(determine_secrets_file "$STACK")"; exit $?
+fi
+
+EXTRA=()
+if [[ "${1:-}" == "--" ]]; then shift; EXTRA=("$@"); else EXTRA=("$@"); fi
+
+# Ensure repos/worktrees present and updated for this stack
+[[ -d "$COMPOSE_BARE" && -d "$ENV_BARE" ]] || die "Bare repos missing. Run: docker-sops init $STACK --compose-url ... --env-url ..."
+update_stack "$STACK"
+
+# Secrets → temp env
+SECRETS="$(determine_secrets_file "$STACK")"
+decrypt_env "$SECRETS"
+
+case "$cmd" in
+  up)       note "Up '$STACK'";     run_compose "$STACK" pull "${EXTRA[@]}"; run_compose "$STACK" up -d "${EXTRA[@]}";;
+  down)     note "Down '$STACK'";   run_compose "$STACK" down "${EXTRA[@]}";;
+  pull)     note "Pull '$STACK'";   run_compose "$STACK" pull "${EXTRA[@]}";;
+  ps)                             run_compose "$STACK" ps "${EXTRA[@]}";;
+  logs)                           run_compose "$STACK" logs -f "${EXTRA[@]}";;
+  config)                         run_compose "$STACK" config "${EXTRA[@]}";;
+  restart)  note "Restart '$STACK'"; run_compose "$STACK" restart "${EXTRA[@]}";;
+  help|--help|-h) usage;;
+  *) usage; die "Unknown command: $cmd";;
+esac
