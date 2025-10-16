@@ -23,107 +23,83 @@ It’s built for setups where:
 ## 📦 Installation
 
 ### 1. Clone the repo
-```bash
+```
 git clone https://github.com/Michael-XKCD/docker-sops.git
 cd docker-sops
+```
 
-2. Install the binary
-
-Copy or symlink it to your $PATH:
-
+### 2. Install the binary
+```
 sudo cp docker-sops /usr/local/bin/
 sudo chmod +x /usr/local/bin/docker-sops
+```
 
-3. Prepare directories
-
-sudo mkdir -p /mnt/user/Docker
-sudo chown "$USER":"$USER" /mnt/user/Docker
-
-4. Verify dependencies
+### 3. Verify dependencies
 
 You’ll need:
-	•	Docker with the Compose plugin
-	•	Git 2.30+
+	•	Docker + Docker Compose
 	•	Mozilla SOPS
-	•	GPG or age key for decryption
+	•	Age (optional) for decryption
 
-Test it:
-
+### 4. Test it
+```
 docker-sops help
+```
 
+---
 
-⸻
-
-🔐 Installing SOPS
+## 🔐 Installing SOPS
 
 You’ll need SOPS on both your server and development machine to encrypt/decrypt .env files.
 
 macOS (Homebrew)
-
+```
 brew install sops
-
+```
 Debian / Ubuntu
-
+```
 sudo apt update
 sudo apt install -y sops
-
+```
 RHEL / CentOS / Fedora
-
+```
 sudo dnf install -y sops
-
+````
 Arch Linux
-
+```
 sudo pacman -S sops
-
+```
 Manual install (universal)
-
+```
 wget https://github.com/mozilla/sops/releases/latest/download/sops-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)
 sudo mv sops-* /usr/local/bin/sops
 sudo chmod +x /usr/local/bin/sops
-
+```
 Test:
-
+```
 sops --version
+```
 
+---
 
-⸻
+## 🔐 Getting Started with SOPS
 
-🔐 Getting Started with SOPS
+### 1. Generate a key
 
-1. Generate a key
-
-Option 1: GPG
-
-gpg --full-generate-key
-
-Option 2: age
-
+Example (age)
+```
 mkdir -p ~/.config/sops/age
 age-keygen -o ~/.config/sops/age/keys.txt
+```
 
+---
 
-⸻
-
-2. Configure SOPS
+### 2. Configure SOPS
 
 Create a file called .sops.yaml at the root of your docker-compose-env repo.
 
-Example (GPG)
-
-# .sops.yaml
-creation_rules:
-  - path_regex: '.*\.env\.sops$'
-    encrypted_regex: '^(?!#).*'
-    key_groups:
-      - pgp:
-          - FINGERPRINT_OF_YOUR_GPG_KEY
-
-To find your key fingerprint:
-
-gpg --list-keys
-
 Example (age)
-
+```
 # .sops.yaml
 creation_rules:
   - path_regex: '.*\.env\.sops$'
@@ -131,43 +107,43 @@ creation_rules:
     key_groups:
       - age:
           - age1examplekeyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
 
-
-⸻
-
-3. Encrypt an env file
+### 3. Encrypt an env file
 
 Create and encrypt your stack’s .env:
-
+```
 cd docker-compose-env/librechat
 sops --encrypt --in-place librechat.env.sops
+```
 
-4. Test decryption
-
+### 4. Test decryption
+```
 sops -d librechat.env.sops | head
+```
 
+---
 
-⸻
+## 🚀 First Use
 
-🚀 First Use
-
-1. Initialize a stack
+### 1. Initialize a stack
 
 This links both repos, sets up sparse worktrees, and creates symlinks:
-
+```
 docker-sops init librechat \
   --compose-url https://github.com/<you>/docker-compose \
   --env-url https://github.com/<you>/docker-compose-env
+```
 
-2. Deploy
-
+### 2. Deploy
+```
 cd /mnt/user/Docker/librechat
 docker-sops up
+```
 
+---
 
-⸻
-
-🧰 Common Commands
+## 🧰 Common Commands
 
 Task	Command
 View logs	docker-sops logs
@@ -183,7 +159,7 @@ You can run all these commands without specifying the stack name if you’re ins
 
 ⸻
 
-🧭 Directory Layout
+## 🧭 Directory Layout
 
 /mnt/user/Docker/
 ├── .repos/
@@ -192,17 +168,8 @@ You can run all these commands without specifying the stack name if you’re ins
 ├── .worktrees/
 │   ├── compose-librechat/
 │   └── env-librechat/
-├── librechat/
-│   ├── docker-compose.yml -> symlink into worktree
-│   ├── ...
-│   └── .docker-sops-links
-└── librechat.env.sops -> symlink into env worktree
+└── librechat/
+    ├── docker-compose.yml -> symlink into worktree
+    ├── ...
+    └── librechat.env.sops -> symlink into env worktree
 
-
-⸻
-
-⚙️ Notes
-	•	Each stack is isolated — docker-sops only decrypts and composes what you call.
-	•	Temporary decrypted env files are securely deleted after each run.
-	•	Public-safe — no plaintext secrets or key material ever logged or stored.
-	•	Works great alongside Dozzle for log viewing and watch docker ps for quick stack monitoring.

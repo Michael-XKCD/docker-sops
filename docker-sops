@@ -79,14 +79,14 @@ EOF
 # -------- paths for a stack --------
 compose_worktree_dir(){ echo "${WORKTREES_DIR}/compose-$1"; }
 env_worktree_dir(){     echo "${WORKTREES_DIR}/env-$1"; }
-compose_repo_subdir(){  echo "docker-compose/$1"; }
-env_repo_subdir(){      echo "docker-compose-env/$1"; }
+compose_repo_subdir(){  echo "$1"; }
+env_repo_subdir(){      echo "$1"; }
 
 compose_src_dir(){ echo "$(compose_worktree_dir "$1")/$(compose_repo_subdir "$1")"; }
 env_secret_src(){  echo "$(env_worktree_dir "$1")/$(env_repo_subdir "$1")/$1.env.sops"; }
 
 stack_flat_dir(){  echo "${BASE_DIR}/$1"; }
-top_secret_link(){ echo "${BASE_DIR}/$1.env.sops"; }
+top_secret_link(){ echo "${BASE_DIR}/$1/$1.env.sops"; }
 
 # Infer stack from CWD if inside /mnt/user/Docker/<stack>[/...]
 infer_stack_from_cwd(){
@@ -109,29 +109,32 @@ ensure_bare_repo(){
   if [[ ! -d "$bare" ]]; then
     mkdir -p "$(dirname "$bare")"
     note "Cloning bare repo -> $bare"
-    git clone --bare --branch "$branch" "$url" "$bare" >/dev/null
+    git clone --bare "$url" "$bare" >/dev/null
+    git --git-dir="$bare" fetch origin >/dev/null
   else
     git --git-dir="$bare" remote set-url origin "$url" || true
     git --git-dir="$bare" fetch origin >/dev/null
   fi
+  # NEW: create/update local branch to track origin/<branch>
+  git --git-dir="$bare" branch -f "$branch" "origin/$branch" >/dev/null 2>&1 || true
 }
 
 ensure_sparse_worktree(){
   local bare="$1" wdir="$2" branch="$3" pathspec="$4"
-  if [[ ! -d "$wdir/.git" ]]; then
+  if [[ ! -e "$wdir/.git" ]]; then
     mkdir -p "$wdir"
-    git --git-dir="$bare" worktree add --detach "$wdir" "origin/$branch" >/dev/null
+    git --git-dir="$bare" worktree add --detach "$wdir" "$branch" >/dev/null
     (
       cd "$wdir"
       git sparse-checkout init --cone
       git sparse-checkout set "$pathspec"
-      git checkout -q "origin/$branch"
+      git checkout -q "$branch"
     )
   else
     (
       cd "$wdir"
       git fetch -q origin
-      git checkout -q "origin/$branch"
+      git checkout -q "$branch"
       git pull -q --ff-only || true
       git sparse-checkout set "$pathspec"
     )
@@ -195,11 +198,11 @@ determine_secrets_file(){
 
 decrypt_env(){
   local sops_file="$1"
-  local data
-  data="$($SOPS_BIN -d "$sops_file")" || die "Failed to decrypt: $sops_file"
   TEMP_ENV="$(mktemp -t "${STACK}.env.XXXXXXXX")"
   chmod 600 "$TEMP_ENV"
-  printf '%s' "$data" > "$TEMP_ENV"
+  # Treat the file as dotenv on decrypt, and also output as dotenv
+  $SOPS_BIN -d --input-type dotenv --output-type dotenv "$sops_file" > "$TEMP_ENV" \
+    || die "Failed to decrypt: $sops_file"
 }
 
 compose_yml_path(){ echo "$(compose_src_dir "$1")/docker-compose.yml"; }
@@ -209,7 +212,11 @@ run_compose(){
   local yml
   yml="$(compose_yml_path "$stack")"
   [[ -f "$yml" ]] || die "Compose file not found: $yml"
-  ( cd "$(stack_flat_dir "$stack")" && $DOCKER_BIN compose --env-file "$TEMP_ENV" -f "$yml" "$@" )
+  (
+    cd "$(stack_flat_dir "$stack")"
+    ENVFILE="$TEMP_ENV" \
+    $DOCKER_BIN compose --env-file "$TEMP_ENV" -f "$yml" "$@"
+  )
 }
 
 # -------- convenience git wrappers --------
@@ -227,8 +234,8 @@ init_stack(){
   ensure_bare_repo "$COMPOSE_BARE" "${COMPOSE_REPO_URL}" "${COMPOSE_BRANCH:-main}"
   ensure_bare_repo "$ENV_BARE"     "${ENV_REPO_URL}"     "${ENV_BRANCH:-main}"
 
-  ensure_sparse_worktree "$COMPOSE_BARE" "$(compose_worktree_dir "$stack")" "${COMPOSE_BRANCH:-main}" "docker-compose/${stack}"
-  ensure_sparse_worktree "$ENV_BARE"     "$(env_worktree_dir "$stack")"     "${ENV_BRANCH:-main}"     "docker-compose-env/${stack}"
+  ensure_sparse_worktree "$COMPOSE_BARE" "$(compose_worktree_dir "$stack")" "${COMPOSE_BRANCH:-main}" "$(compose_repo_subdir "$stack")"
+  ensure_sparse_worktree "$ENV_BARE"     "$(env_worktree_dir "$stack")"     "${ENV_BRANCH:-main}"     "$(env_repo_subdir "$stack")"
 
   refresh_flat_links "$stack"
   ensure_secret_link "$stack"
@@ -238,8 +245,8 @@ init_stack(){
 update_stack(){
   local stack="$1"
   read_conf
-  ensure_sparse_worktree "$COMPOSE_BARE" "$(compose_worktree_dir "$stack")" "${COMPOSE_BRANCH:-main}" "docker-compose/${stack}"
-  ensure_sparse_worktree "$ENV_BARE"     "$(env_worktree_dir "$stack")"     "${ENV_BRANCH:-main}"     "docker-compose-env/${stack}"
+  ensure_sparse_worktree "$COMPOSE_BARE" "$(compose_worktree_dir "$stack")" "${COMPOSE_BRANCH:-main}" "$(compose_repo_subdir "$stack")"
+  ensure_sparse_worktree "$ENV_BARE"     "$(env_worktree_dir "$stack")"     "${ENV_BRANCH:-main}"     "$(env_repo_subdir "$stack")"
   refresh_flat_links "$stack"
   ensure_secret_link "$stack"
 }
@@ -267,7 +274,7 @@ full_push_all(){
 }
 
 # -------- main --------
-need "$SOPS_BIN"; need "$DOCKER_BIN"; $DOCKER_BIN compose version >/devnull 2>&1 || die "Need Docker Compose plugin (docker compose)"
+need "$SOPS_BIN"; need "$DOCKER_BIN"; $DOCKER_BIN compose version >/dev/null 2>&1 || die "Need Docker Compose plugin (docker compose)"
 
 sub="${1:-}"
 
